@@ -40,6 +40,7 @@ All strings are assumed to be UTF-8 encoded.
 - 2.2 - Added Scan Wifi RPC command
 - 2.3 - Added Hostname RPC command
 - 2.4 - Added Device Name RPC command
+- 2.5 - Added Secure Provisioning (Setup Secure Session + Secure Envelope RPC commands, optical SAS)
 
 ## GATT Services
 
@@ -55,6 +56,7 @@ This characteristic has binary encoded byte(s) of the device’s capabilities.
 | `1`       | 1 if the device supports the device info command. |
 | `2`       | 1 if the device supports the scan wifi command.   |
 | `3`       | 1 if the device supports the hostname command.    |
+| `4`       | 1 if the device supports secure provisioning.     |
 
 
 ### Characteristic: Current State
@@ -84,6 +86,8 @@ This characteristic will hold the current error of the provisioning service and 
 | `0x03` | Unable to connect   | The credentials have been received and an attempt to connect to the network has failed. |
 | `0x04` | Not Authorized      | Credentials were sent via RPC but the Improv service is not authorized.                 |
 | `0x05` | Bad Hostname        | The hostname provided was not valid or acceptable by the device.                        |
+| `0x06` | Encryption Required     | The device requires a secure session; plaintext credentials were refused.               |
+| `0x07` | Secure Handshake Failed | The secure session setup failed: bad public key, authentication failure, or timeout.    |
 | `0xFF` | Unknown Error       |
 
 ### Characteristic: RPC Command
@@ -254,6 +258,54 @@ This command will trigger one RPC Response which will contain the Device Name of
 property should reset the authorization timeout.
 
 
+#### RPC Command: Setup Secure Session
+
+Starts an authenticated key exchange so that the Wi-Fi credentials (and any other RPC) can be exchanged encrypted and protected against a man-in-the-middle. See [Secure Provisioning](#secure-provisioning) for the full process.
+
+Command ID: `0x07`
+
+Should only be sent if the capability characteristic indicates that secure provisioning is supported (bit 4).
+
+Request:
+
+| Byte  | Description                                     |
+| ----- | ----------------------------------------------- |
+| 07    | command (`0x07`)                                |
+| 22    | data length (34)                                |
+|       | client X25519 public key (32 bytes)             |
+|       | requested optical bit rate (2 bytes, u16 LE)    |
+| CS    | checksum                                        |
+
+This command generates an RPC result with the device's ephemeral public key and the negotiated optical bit rate:
+
+| Byte  | Description                                     |
+| ----- | ----------------------------------------------- |
+| 07    | command (`0x07`)                                |
+| 22    | data length (34)                                |
+|       | device X25519 public key (32 bytes)             |
+|       | negotiated optical bit rate (2 bytes, u16 LE)   |
+| CS    | checksum                                        |
+
+The result of this command is a raw (unencrypted) payload: it is the only secure-provisioning message not wrapped in a Secure Envelope, because it establishes the key. The public keys are safe to exchange in the clear.
+
+#### RPC Command: Secure Envelope
+
+Carries an encrypted inner RPC command (for example Send Wi-Fi settings) once a secure session has been established with Setup Secure Session.
+
+Command ID: `0x08`
+
+| Byte  | Description                                       |
+| ----- | ------------------------------------------------ |
+| 08    | command (`0x08`)                                 |
+| xx    | data length                                      |
+|       | message counter (8 bytes, u64 LE)                |
+|       | ciphertext (AEAD-encrypted inner RPC packet)     |
+|       | authentication tag (16 bytes)                    |
+| CS    | checksum                                         |
+
+The plaintext is an ordinary RPC packet (command / length / data / checksum), so any command may be secured. The device decrypts it and processes it exactly as if it had been received in the clear; the RPC result is returned wrapped in a Secure Envelope in the same way. See [Secure Provisioning](#secure-provisioning) for the envelope and key details.
+
+
 ### Characteristic: RPC Result
 
 Characteristic UUID: `00467768-6228-2272-4663-277478268004`
@@ -270,6 +322,102 @@ This characteristic is where the client can read results from the RPC service if
 | X...Y     | String 2                                              |
 | ...       | etc                                                   |
 | last byte | Checksum - A simple sum checksum keeping only the LSB |
+
+## Secure Provisioning
+
+Secure provisioning is an optional extension (capability bit 4) that adds confidentiality and man-in-the-middle (MITM) protection to the credential handoff. In the base protocol the Wi-Fi credentials are written in the clear, so a passive listener can capture the password and an active attacker can man-in-the-middle the exchange. This extension leaves the base protocol intact and works over Web Bluetooth (it does not use BLE pairing).
+
+It is authenticated Diffie-Hellman: an ephemeral X25519 exchange provides confidentiality, and a Short Authentication String (SAS) transmitted out-of-band over the device's LED (read by the client's camera) provides MITM protection. It is structurally the same idea as BLE numeric comparison, performed at the application layer.
+
+### Overview
+
+1. (Optional) the user physically authorizes the device, as in the base protocol. The SAS is only emitted once the device is Authorized.
+2. The client sends Setup Secure Session (`0x07`) with its ephemeral X25519 public key and a requested optical bit rate. The device replies with its own ephemeral public key and the negotiated bit rate.
+3. Both sides derive the session key and the SAS (below). The device begins flashing the SAS on its LED, continuously, at the negotiated bit rate.
+4. The client reads the SAS with its camera and compares it with the value it computed. On mismatch it aborts and sends nothing. On match it sends the Wi-Fi credentials inside a Secure Envelope (`0x08`).
+5. The device stops flashing, decrypts the envelope, and continues exactly as the base protocol (Provisioning, then Provisioned with an optional redirect URL, returned in a Secure Envelope).
+
+### Cryptographic primitives
+
+| Purpose             | Primitive                                    |
+| ------------------- | -------------------------------------------- |
+| Key agreement       | X25519 (RFC 7748), 32-byte keys              |
+| Hash                | SHA-256                                       |
+| Key derivation      | HKDF-SHA-256 (RFC 5869)                       |
+| Authenticated enc.  | ChaCha20-Poly1305 (RFC 8439), 256-bit key    |
+
+Keys are 32 bytes encoded per RFC 7748. Multi-byte integers are little-endian.
+
+### Key derivation
+
+Let `c_pub` / `d_pub` be the client and device public keys and `ss` the X25519 shared secret (identical on both sides). Define:
+
+```
+transcript = c_pub (32 bytes) || d_pub (32 bytes)
+
+K   = HKDF-SHA-256(salt = "improv-ble-secure-v1", ikm = ss,
+                   info = 0x01 || transcript, L = 32)
+
+SAS = SHA-256("improv-ble-secure-v1-sas" || transcript || ss)[0..3]   (32 bits)
+```
+
+`K` is the Secure Envelope key. `SAS` is the 32-bit value flashed on the LED and verified by the client. A man-in-the-middle holds different public keys with each side, so the SAS it produces with the device differs from the one the client computes; the client's comparison fails and it aborts before releasing credentials. 32 bits is sufficient because the attacker gets a single online attempt (it must commit to its keys before the SAS is revealed): a forced collision succeeds with probability about 2^-32 per provisioning attempt.
+
+### Secure Envelope (command 0x08)
+
+The `data` field of a Secure Envelope is:
+
+```
+counter    : u64 little-endian (8 bytes)   per-direction message counter, from 0
+ciphertext : N bytes                        AEAD ciphertext of an inner RPC packet
+tag        : 16 bytes                        Poly1305 authentication tag
+```
+
+AEAD parameters:
+
+```
+key       = K
+nonce     = dir (1 byte) || 0x00 0x00 0x00 || counter (u64 LE)   (12 bytes)
+            dir = 0x00 client to device, 0x01 device to client
+aad       = "improv-ble-secure-v1" || dir
+plaintext = an inner RPC packet (command || length || data || checksum)
+```
+
+Each direction keeps its own counter, starting at 0 and incremented per envelope; `dir` plus the per-direction counter ensures the nonce is never reused under `K`. A receiver MUST reject an envelope whose counter does not strictly increase for its direction, and MUST reject any envelope that fails authentication (error `0x07`). A successful decryption is itself proof that both sides hold the same `K`.
+
+### Optical channel - Profile 1
+
+The device transmits the 32-bit SAS by modulating its LED at the negotiated bit rate `R`; the client decodes it with its camera. Profile 1 is mandatory to implement.
+
+- Modulation: NRZ on-off keying (LED on = 1, off = 0), one bit per symbol period `1/R`. Because the rate is negotiated the receiver knows it and recovers phase from the preamble, so Manchester self-clocking is not needed.
+- Bit-rate negotiation: the client requests `floor(max_camera_fps / 3)` bits per second (three camera samples per symbol), defaulting to 40 bps (about 120 fps) if it cannot determine its camera rate. The device replies with `min(requested, device_max)`, capping at what its LED can modulate. Both clamp to 5-255 bps. The rate is a transport hint only and is not part of the transcript, key or SAS.
+- The device SHOULD hold its symbol clock within 2%.
+- Bit order is most-significant-bit first.
+- Frame (transmitted repeatedly until the Secure Envelope arrives):
+
+```
+preamble : 0xAA 0xAA   trains symbol timing / phase
+sfd      : 0x7E        start-of-frame delimiter
+version  : 0x01        optical profile / SAS format version
+sas      : SAS         32 bits
+crc      : CRC-8       poly 0x07, over version || sas
+```
+
+The client locks phase on the preamble, waits for the SFD, checks `version` and `crc`, and SHOULD require two consecutive identical valid frames before comparing the SAS. At 40 bps the 72-bit frame takes about 1.8 s; at 5 bps about 14 s.
+
+### Downgrade protection
+
+The capability byte is read over the unauthenticated link, so an active attacker could hide the secure capability to force plaintext. Therefore:
+
+- A client that requires security MUST offer a "secure only" mode and MUST NOT send plaintext credentials in that mode, regardless of the advertised capability.
+- A device MAY be configured to require security: it then refuses the plaintext Send Wi-Fi settings command with error `0x06` (Encryption Required) and accepts credentials only inside a Secure Envelope.
+
+### Security considerations
+
+- Both sides MUST use fresh ephemeral keys per session (forward secrecy).
+- The SAS authenticates the device-to-client direction; the client MUST abort on SAS mismatch before sending the Secure Envelope. The device gains assurance about the client from the physical authorization and from a successful envelope decryption.
+- The device SHOULD discard the session and stop flashing after a timeout (suggested 60 s) if no valid envelope arrives.
+
 
 ## Bluetooth LE Advertisement
 
