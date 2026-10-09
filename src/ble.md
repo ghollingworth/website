@@ -385,25 +385,87 @@ plaintext = an inner RPC packet (command || length || data || checksum)
 
 Each direction keeps its own counter, starting at 0 and incremented per envelope; `dir` plus the per-direction counter ensures the nonce is never reused under `K`. A receiver MUST reject an envelope whose counter does not strictly increase for its direction, and MUST reject any envelope that fails authentication (error `0x07`). A successful decryption is itself proof that both sides hold the same `K`.
 
-### Optical channel - Profile 1
+### Optical channel
 
-The device transmits the 32-bit SAS by modulating its LED at the negotiated bit rate `R`; the client decodes it with its camera. Profile 1 is mandatory to implement.
+The device transmits the SAS over a one-way framed optical link: it modulates its LED and the
+client reads it with its camera. The link is general - the SAS is one frame type and a device log
+is another - but only the SAS is required for secure provisioning. Wire format version 2 is
+mandatory to implement.
 
-- Modulation: NRZ on-off keying (LED on = 1, off = 0), one bit per symbol period `1/R`. Because the rate is negotiated the receiver knows it and recovers phase from the preamble, so Manchester self-clocking is not needed.
-- Bit-rate negotiation: the client requests `floor(max_camera_fps / 3)` bits per second (three camera samples per symbol), defaulting to 40 bps (about 120 fps) if it cannot determine its camera rate. The device replies with `min(requested, device_max)`, capping at what its LED can modulate. Both clamp to 5-255 bps. The rate is a transport hint only and is not part of the transcript, key or SAS.
-- The device SHOULD hold its symbol clock within 2%.
+- **Line coding: Manchester** (G.E. Thomas), a 1 bit sent as LED on then off and a 0 bit as off
+  then on. Two chips per bit, so a bit rate `R` puts `2R` chips a second on the LED. Manchester is
+  used rather than NRZ for three reasons: the receiver recovers the bit clock from any payload, so
+  a run of identical bits cannot stall a camera's threshold tracking; a misread chip shows up as a
+  Manchester violation at a known bit position, which is an erasure the receiver can repair or
+  mark rather than a silent error; and it survives a mismatch between the negotiated rate and the
+  rate the camera actually achieves.
+- **Bit-rate negotiation:** the client requests `floor(camera_fps / 6)` bits per second - three
+  camera samples per chip, two chips per bit - defaulting to 40 bps if it cannot determine its
+  camera rate. The device replies with `min(requested, device_max)`, capping at what its LED can
+  modulate. Both clamp to 5-255 bps. The rate is a transport hint only and is not part of the
+  transcript, key or SAS.
+- A client SHOULD derive that figure from the frame rate its camera **achieves**, not the rate it
+  requests. A camera that advertises 240 fps but delivers 160 cannot carry 40 bps, and the frames
+  it drops are invisible unless it asks for them.
+- The device SHOULD hold its chip clock within a quarter of a chip. A chip that goes out later
+  than that can round either edge of a Manchester run the wrong way, so the device SHOULD abandon
+  the frame, hold the LED off for a byte's worth of chips, and send that frame again rather than
+  put one on the wire that cannot be decoded.
 - Bit order is most-significant-bit first.
-- Frame (transmitted repeatedly until the Secure Envelope arrives):
+
+#### Frame
 
 ```
-preamble : 0xAA 0xAA   trains symbol timing / phase
-sfd      : 0x7E        start-of-frame delimiter
-version  : 0x01        optical profile / SAS format version
-sas      : SAS         32 bits
-crc      : CRC-8       poly 0x07, over version || sas
+preamble : 0x55 0x55   trains the threshold and the chip clock
+sfd      : 0x7E        start of frame: fixes byte alignment, resolves polarity
+ctl0     : version(2) | type(2) | msgid(4)
+ctl1     : index(4) | final(1) | length-1(3)
+payload  : 1 to 8 bytes
+crc      : CRC-8, polynomial 0x07, over ctl0 || ctl1 || payload
 ```
 
-The client locks phase on the preamble, waits for the SFD, checks `version` and `crc`, and SHOULD require two consecutive identical valid frames before comparing the SAS. At 40 bps the 72-bit frame takes about 1.8 s; at 5 bps about 14 s.
+| Field | Bits | Meaning |
+| --- | --- | --- |
+| `version` | 2 | Wire format version. `2` for this document. |
+| `type` | 2 | `0` SAS, `1` device log, `2` reserved for parity, `3` reserved. |
+| `msgid` | 4 | Identifies the message. Changes per message, wraps at 16. |
+| `index` | 4 | Chunk number within the message, from 0. |
+| `final` | 1 | Set on the last chunk of the message. |
+| `length` | 3 | Payload bytes minus one, so 1 to 8. |
+
+The SFD is required even though the preamble marks the start of a frame. Manchester-encoded,
+`0x55` is a chip pattern that repeats every four chips, so a preamble of any length aligns the
+receiver only to a two-bit boundary; the SFD is what pins the byte boundary. It also resolves
+polarity, since an inverted preamble is the same pattern shifted and a device whose LED is dark
+for a 1 is otherwise indistinguishable.
+
+#### Messages, chunks and repeats
+
+A message longer than eight bytes is split into chunks, each sent as its own frame, sharing one
+`msgid` and numbered by ascending `index` with `final` set on the last. The 32-bit SAS is four
+bytes and so is always a single chunk.
+
+Frames are short because a frame is only useful if every one of its bits survives: the chance of a
+clean frame falls off sharply with its length, and a slipped chip costs the receiver everything up
+to the next SFD. Chunking also lets a receiver display what it has rather than wait for a whole
+message.
+
+The device transmits repeatedly until the Secure Envelope arrives. **A repeat MUST be
+byte-identical** - the same `msgid` and `index`, so the same bytes - so that a receiver holding a
+damaged copy can combine it with the next one. Loss is detected from gaps in the
+(`msgid`, `index`) pair: a missing index within a message is a lost chunk, and a jump in `msgid`
+is a lost message.
+
+At 40 bps the ten-byte SAS frame takes 2.0 s; at 5 bps about 16 s.
+
+#### Client behaviour
+
+The client locks on the preamble and SFD, checks `version` and `crc`, and SHOULD require two
+consecutive identical valid frames before comparing the SAS. A client MUST NOT display or act on
+the contents of a frame that fails its CRC when that frame is a SAS: showing a corrupted
+verification code to the user defeats the purpose of the channel. A client MAY display the
+contents of a failed frame of another type, such as a log, provided it marks it as unverified and
+does not trust the length field, which may itself be corrupt.
 
 ### Downgrade protection
 
